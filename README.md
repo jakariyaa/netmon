@@ -1,19 +1,17 @@
-## Network Monitor for XFCE
+# xfce4-genmon-goodies
 
-This project is my fork of [xfce-hkmon](https://lightful.github.io/xfce-hkmon/).
+Collection of small Genmon plugins and utilities for Xfce Genmon.
 
-### Installation & Usage
+**Overview**
+- **Purpose**: Handy monitors and plugins to display network and temperature info in Xfce's Genmon plugin.
 
-1. Download [netmon.cpp](netmon.cpp) and compile it (you only need gcc or clang installed):
-```bash
-g++ -std=c++0x -O3 -lrt netmon.cpp -o netmon
-```
-2. Place the executable somewhere (e.g. /usr/local/bin)
-```
-sudo cp netmon /usr/local/bin/
-```
-4. Add a XFCE Generic Monitor Applet (xfce4-genmon-plugin) with these settings: no label, 1 second period, *Bitstream Vera Sans Mono* font with size = 7 (recommended) and the following command:
-```
-/usr/local/bin/netmon NET
-```
-_Or alternatively, you could try to run the given executable (x86_64)._
+**Projects**
+- **netmon**: Network monitor plugin. See [netmon README](netmon/README.md) and source at `netmon/netmon.cpp`.
+- **tempmon**: Temperature monitor utility. See [tempmon README](tempmon/README.md) and source at `tempmon/tempmon.c`.
+
+**Contributing**
+- **New Plugins**: Contributions of new Genmon plugins are welcome!
+- **Issues & PRs**: Please open issues or pull requests for bug fixes and improvements.
+
+**License**
+- This repository is licensed under the terms in the `LICENSE` file.
