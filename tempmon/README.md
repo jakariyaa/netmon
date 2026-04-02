@@ -6,8 +6,9 @@ This program reads CPU temperature from the kernel's hwmon interface and prints 
 
 1. Compile the program (you only need `gcc` or `clang` installed):
 ```bash
-gcc -std=gnu11 -O3 -march=native -flto -pipe -s tempmon.c -o tempmon
+gcc -std=gnu11 -O2 -flto -pipe -s tempmon.c -o tempmon
 ```
+For maximum cross-machine portability, avoid `-march=native`.
 2. Place the executable somewhere (e.g. `/usr/local/bin`):
 ```bash
 sudo mv tempmon /usr/local/bin/
