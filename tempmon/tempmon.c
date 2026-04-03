@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <errno.h>
+#include <time.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -17,9 +18,65 @@
 #define HWMON_PREFIX "/sys/class/hwmon/"
 #define HWMON_PREFIX_LEN (sizeof(HWMON_PREFIX) - 1)
 #define MAX_PATH PATH_MAX
+#define FAN_RESCAN_BACKOFF_SEC 30
+
+static int read_fan_rpm_from_path(const char *fan_path, int *rpm);
+static int find_fan_path(char *fan_path, size_t fan_path_size);
+
+static int parse_long_str(const char *src, long *value) {
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(src, &end, 10);
+    if (errno != 0 || end == src || *end != '\0')
+        return -1;
+    *value = v;
+    return 0;
+}
+
+static int is_temp_millic_sane(long temp_millic) {
+    return temp_millic >= -20000 && temp_millic <= 150000;
+}
+
+static int parse_temp_input_name(const char *name, int *idx) {
+    int parsed_len = 0;
+    int parsed_idx = 0;
+    if (sscanf(name, "temp%d_input%n", &parsed_idx, &parsed_len) != 1 ||
+        parsed_idx <= 0 ||
+        parsed_len != (int)strlen(name))
+        return -1;
+
+    if (idx)
+        *idx = parsed_idx;
+    return 0;
+}
+
+static ssize_t read_retry_eintr(int fd, void *buf, size_t count) {
+    for (;;) {
+        ssize_t n = read(fd, buf, count);
+        if (n < 0 && errno == EINTR)
+            continue;
+        return n;
+    }
+}
+
+static int write_all_retry_eintr(int fd, const char *buf, size_t len) {
+    size_t off = 0;
+    while (off < len) {
+        ssize_t n = write(fd, buf + off, len - off);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        if (n == 0)
+            return -1;
+        off += (size_t)n;
+    }
+    return 0;
+}
 
 static ssize_t read_fd_first_line(int fd, char *buf, size_t bufsize) {
-    ssize_t n = read(fd, buf, bufsize - 1);
+    ssize_t n = read_retry_eintr(fd, buf, bufsize - 1);
     if (n <= 0) return -1;
 
     char *nl = memchr(buf, '\n', (size_t)n);
@@ -51,14 +108,7 @@ static int read_long_from_file(const char *path, long *value) {
     if (read_file_first_line(path, buf, sizeof(buf)) <= 0)
         return -1;
 
-    char *end = NULL;
-    errno = 0;
-    long v = strtol(buf, &end, 10);
-    if (errno != 0 || end == buf || *end != '\0')
-        return -1;
-
-    *value = v;
-    return 0;
+    return parse_long_str(buf, value);
 }
 
 static int read_long_from_file_at(int dirfd, const char *name, long *value) {
@@ -66,14 +116,7 @@ static int read_long_from_file_at(int dirfd, const char *name, long *value) {
     if (read_file_first_line_at(dirfd, name, buf, sizeof(buf)) <= 0)
         return -1;
 
-    char *end = NULL;
-    errno = 0;
-    long v = strtol(buf, &end, 10);
-    if (errno != 0 || end == buf || *end != '\0')
-        return -1;
-
-    *value = v;
-    return 0;
+    return parse_long_str(buf, value);
 }
 
 static void xml_escape(const char *src, char *dst, size_t dst_size) {
@@ -149,9 +192,35 @@ static int read_first_fan_rpm(int hwfd) {
 static int write_cache_line(const char *path, const char *value) {
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) return -1;
-    ssize_t wr = write(fd, value, strlen(value));
+    int rc = write_all_retry_eintr(fd, value, strlen(value));
     close(fd);
-    return wr >= 0 ? 0 : -1;
+    return rc;
+}
+
+static int write_no_fan_cache(const char *path) {
+    char marker[64];
+    long now = (long)time(NULL);
+    if (snprintf(marker, sizeof(marker), "none:%ld", now) >= (int)sizeof(marker))
+        return -1;
+    return write_cache_line(path, marker);
+}
+
+static int should_defer_fan_rescan(const char *cached_line) {
+    const char *prefix = "none:";
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(cached_line, prefix, prefix_len) != 0)
+        return 0;
+
+    const char *ts_str = cached_line + prefix_len;
+    long ts = 0;
+    if (parse_long_str(ts_str, &ts) != 0)
+        return 0;
+
+    long now = (long)time(NULL);
+    if (now < ts)
+        return 0;
+
+    return (now - ts) < FAN_RESCAN_BACKOFF_SEC;
 }
 
 static int score_cpu_chip_name(const char *name) {
@@ -211,15 +280,14 @@ static int find_cpu_temp_path(char *temp_path, size_t temp_path_size) {
         struct dirent *hwe;
         while ((hwe = readdir(hwdir))) {
             int idx = 0;
-            if (sscanf(hwe->d_name, "temp%d_input", &idx) != 1 || idx <= 0)
+            if (parse_temp_input_name(hwe->d_name, &idx) != 0)
                 continue;
 
             long temp_millic = 0;
             if (read_long_from_file_at(hwfd, hwe->d_name, &temp_millic) != 0)
                 continue;
 
-            // Filter invalid or clearly bogus sensor values.
-            if (temp_millic < -20000 || temp_millic > 150000)
+            if (!is_temp_millic_sane(temp_millic))
                 continue;
 
             char label_name[32];
@@ -252,6 +320,59 @@ static int find_cpu_temp_path(char *temp_path, size_t temp_path_size) {
     return 0;
 }
 
+static int cached_temp_path_is_usable(const char *temp_path) {
+    if (strncmp(temp_path, HWMON_PREFIX, HWMON_PREFIX_LEN) != 0)
+        return -1;
+
+    const char *base = strrchr(temp_path, '/');
+    if (!base || *(base + 1) == '\0')
+        return -1;
+    base++;
+
+    if (parse_temp_input_name(base, NULL) != 0)
+        return -1;
+
+    long temp_millic = 0;
+    if (read_long_from_file(temp_path, &temp_millic) != 0)
+        return -1;
+
+    if (!is_temp_millic_sane(temp_millic))
+        return -1;
+
+    return 0;
+}
+
+static int resolve_fan_rpm(int hwfd, const char *fan_cache_path) {
+    int fan_rpm = read_first_fan_rpm(hwfd);
+    if (fan_rpm >= 0)
+        return fan_rpm;
+
+    int skip_scan = 0;
+    char fan_path[MAX_PATH];
+    if (read_file_first_line(fan_cache_path, fan_path, sizeof(fan_path)) > 0) {
+        if (strncmp(fan_path, HWMON_PREFIX, HWMON_PREFIX_LEN) == 0) {
+            if (read_fan_rpm_from_path(fan_path, &fan_rpm) != 0)
+                unlink(fan_cache_path);
+        } else if (should_defer_fan_rescan(fan_path)) {
+            skip_scan = 1;
+        } else {
+            unlink(fan_cache_path);
+        }
+    }
+
+    if (fan_rpm >= 0 || skip_scan)
+        return fan_rpm;
+
+    if (find_fan_path(fan_path, sizeof(fan_path)) == 0) {
+        if (read_fan_rpm_from_path(fan_path, &fan_rpm) == 0)
+            (void)write_cache_line(fan_cache_path, fan_path);
+    } else {
+        (void)write_no_fan_cache(fan_cache_path);
+    }
+
+    return fan_rpm;
+}
+
 static int read_fan_rpm_from_path(const char *fan_path, int *rpm) {
     if (strncmp(fan_path, HWMON_PREFIX, HWMON_PREFIX_LEN) != 0)
         return -1;
@@ -273,7 +394,8 @@ static int find_fan_path(char *fan_path, size_t fan_path_size) {
         if (strncmp(entry->d_name, "hwmon", 5) != 0) continue;
 
         char base[MAX_PATH];
-        snprintf(base, sizeof(base), "%s/%s", HWMON_PATH, entry->d_name);
+        if (snprintf(base, sizeof(base), "%s/%s", HWMON_PATH, entry->d_name) >= (int)sizeof(base))
+            continue;
 
         int hwfd = open(base, O_RDONLY | O_DIRECTORY);
         if (hwfd < 0) continue;
@@ -321,23 +443,8 @@ static int print_genmon_output(const char *temp_path, const char *fan_cache_path
     char sensor_name[64] = "unknown";
     (void)read_file_first_line_at(hwfd, "name", sensor_name, sizeof(sensor_name));
 
-    int fan_rpm = read_first_fan_rpm(hwfd);
+    int fan_rpm = resolve_fan_rpm(hwfd, fan_cache_path);
     close(hwfd);
-
-    if (fan_rpm < 0) {
-        char fan_path[MAX_PATH];
-        if (read_file_first_line(fan_cache_path, fan_path, sizeof(fan_path)) > 0) {
-            if (read_fan_rpm_from_path(fan_path, &fan_rpm) != 0)
-                unlink(fan_cache_path);
-        }
-
-        if (fan_rpm < 0) {
-            if (find_fan_path(fan_path, sizeof(fan_path)) == 0) {
-                if (read_fan_rpm_from_path(fan_path, &fan_rpm) == 0)
-                    (void)write_cache_line(fan_cache_path, fan_path);
-            }
-        }
-    }
 
     char esc_sensor_name[160];
     xml_escape(sensor_name, esc_sensor_name, sizeof(esc_sensor_name));
@@ -349,10 +456,10 @@ static int print_genmon_output(const char *temp_path, const char *fan_cache_path
         snprintf(fan_line, sizeof(fan_line), "n/a");
 
     printf("<txt>%ld°C</txt>\n", temp_c);
-        printf("<tool>Sensor: %s\nStatus: %s\nFan: %s</tool>\n",
-            esc_sensor_name,
-            temp_status(temp_c),
-            fan_line);
+    printf("<tool>Sensor: %s\nStatus: %s\nFan: %s</tool>\n",
+           esc_sensor_name,
+           temp_status(temp_c),
+           fan_line);
 
     return 0;
 }
@@ -370,18 +477,24 @@ int main(void) {
         snprintf(fan_cache_path, sizeof(fan_cache_path), "/run/user/%d/cpu_fan_path", getuid());
     }
 
-    char path[MAX_PATH];
+    char path[MAX_PATH] = "";
 
-    // Try cache
+    // Fast path: use cache when it still points to a valid tempN_input sensor.
+    // This avoids rescanning all hwmon entries on every plugin refresh.
     if (read_file_first_line(cache_path, path, sizeof(path)) > 0) {
-        if (print_genmon_output(path, fan_cache_path) == 0) return 0;
+        if (cached_temp_path_is_usable(path) == 0) {
+            if (print_genmon_output(path, fan_cache_path) == 0)
+                return 0;
+        }
         unlink(cache_path);
     }
 
-    // Scan
+    // Slow path: scan and refresh cache when needed.
     if (find_cpu_temp_path(path, sizeof(path)) == 0) {
         (void)write_cache_line(cache_path, path);
-        return print_genmon_output(path, fan_cache_path);
+        if (print_genmon_output(path, fan_cache_path) == 0)
+            return 0;
+        unlink(cache_path);
     }
 
     fprintf(stderr, "No matching sensor found\n");
